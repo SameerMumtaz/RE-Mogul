@@ -70,6 +70,103 @@ const pmtCalc = (P, annualRate, years) => {
     n = Math.max(1, Math.round(years * 12));
   return P * r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1);
 };
+
+/* ============ SALE TAXATION (single source of truth) ============
+   Commercial real estate sales are taxed in three realistic layers:
+   1. Unrecaptured §1250 depreciation recapture — max 25% on straight-line
+      depreciation allowed-or-allowable over the hold (39-yr SL on the ~80%
+      building portion of basis; land isn't depreciable). The IRS recaptures
+      this even if never claimed.
+   2. Long-term capital gain — 20% on true appreciation above original cost.
+   3. Net Investment Income Tax (NIIT) — 3.8% on the whole gain for high earners
+      (which a mogul unquestionably is).
+   Recapture is capped at the total gain. A 1031 exchange defers ALL of it. */
+const TAX = {
+  recapture: 0.25,
+  ltcg: 0.20,
+  niit: 0.038,
+  buildingFrac: 0.80,
+  deprecYears: 39
+};
+
+/* ============ PERFORMANCE MATH ============
+   IRR is solved properly: monthly cash flows from acquisition (equity out at
+   month 0, net operating CF each month, one-off capital in/out via flowAdj),
+   terminated with a hypothetical net sale TODAY (95% of value, less debt,
+   less the real three-layer tax). Monthly rate found by bisection on NPV,
+   then annualized. No approximations. */
+const irrFromFlows = flows => {
+  // flows[0] typically negative (equity in). Needs at least one sign change.
+  if (!flows.length || !flows.some(f => f > 0) || !flows.some(f => f < 0)) return null;
+  const npv = r => flows.reduce((a, f, i) => a + f / Math.pow(1 + r, i), 0);
+  let lo = -0.95 / 12,
+    hi = 2.0; // monthly bounds: −95%/yr to +2400%/yr
+  let fLo = npv(lo),
+    fHi = npv(hi);
+  if (fLo * fHi > 0) return null; // no bracketed root
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2,
+      fm = npv(mid);
+    if (fLo * fm <= 0) {
+      hi = mid;
+      fHi = fm;
+    } else {
+      lo = mid;
+      fLo = fm;
+    }
+  }
+  const rm = (lo + hi) / 2;
+  return Math.pow(1 + rm, 12) - 1; // annualized
+};
+const propPerf = (p, month) => {
+  const flows = p.flows || [];
+  const invested = (p.initialEquity || 0) + (p.investedExtra || 0);
+  const cumCF = flows.reduce((a, f) => a + f, 0);
+  const held = month - (p.trackStart != null ? p.trackStart : p.boughtMonth || 0);
+  const stax = saleTax(p.basis, p.value, month - (p.boughtMonth || 0));
+  const terminal = Math.max(0, p.value * 0.95 - p.loan.balance - stax.total);
+  const irr = irrFromFlows([-(p.initialEquity || 0), ...flows.slice(0, -1), (flows.length ? flows[flows.length - 1] : 0) + terminal]);
+  const last12 = flows.slice(-12).reduce((a, f) => a + f, 0);
+  const coc = invested > 0 ? (flows.length >= 12 ? last12 : cumCF * (12 / Math.max(1, flows.length))) / invested : 0;
+  const eqMult = invested > 0 ? (cumCF + terminal) / invested : 0;
+  const apprec = p.value - p.basis;
+  const paydown = p.debtPaid || 0;
+  return {
+    irr,
+    coc,
+    eqMult,
+    invested,
+    cumCF,
+    terminal,
+    apprec,
+    paydown,
+    held
+  };
+};
+const saleTax = (basis, value, monthsHeld) => {
+  const yrs = Math.max(0, monthsHeld / 12);
+  const buildingBasis = basis * TAX.buildingFrac;
+  const dep = Math.min(buildingBasis, buildingBasis / TAX.deprecYears * yrs); // allowed-or-allowable
+  const amountRealized = value * 0.95; // net of 5% selling costs
+  const adjustedBasis = basis - dep;
+  const totalGain = Math.max(0, amountRealized - adjustedBasis);
+  const recaptureGain = Math.min(dep, totalGain); // §1250, capped at gain
+  const ltcgGain = Math.max(0, totalGain - recaptureGain);
+  const recaptureTax = recaptureGain * TAX.recapture;
+  const ltcgTax = ltcgGain * TAX.ltcg;
+  const niitTax = totalGain * TAX.niit;
+  const total = recaptureTax + ltcgTax + niitTax;
+  return {
+    dep,
+    totalGain,
+    recaptureGain,
+    ltcgGain,
+    recaptureTax,
+    ltcgTax,
+    niitTax,
+    total
+  };
+};
 const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 const randRange = (a, b) => a + Math.random() * (b - a);
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
@@ -91,6 +188,11 @@ const dateLabel = m => {
 const LARGE_EXPENSE = 8000;
 const GOAL = 100000000;
 const START_CASH = 30000;
+const START_AGE = 25;
+// Gompertz–Makeham mortality: a small age-independent hazard plus an exponentially
+// rising age term. Roughly matches real actuarial tables: ~0.05%/yr at 25,
+// ~0.2%/yr at 45, ~1.4%/yr at 65, ~8%/yr at 85, ~21%/yr at 95.
+const annualMortality = age => Math.min(0.6, 0.0002 + 0.00003 * Math.exp(0.093 * age));
 const SAVE_KEY = "re-mogul-save-v1";
 function defaultGameState() {
   return {
@@ -113,7 +215,10 @@ function defaultGameState() {
     creditLine: {
       drawn: 0
     },
-    regime: "expansion"
+    regime: "expansion",
+    dead: null,
+    managers: [],
+    mgrCandidates: []
   };
 }
 function loadSave() {
@@ -133,6 +238,20 @@ function loadSave() {
         drawn: 0
       };
       if (!parsed.regime) parsed.regime = "expansion";
+      if (parsed.dead === undefined) parsed.dead = null;
+      if (parsed.escrow && parsed.escrow.taxDeferred == null) parsed.escrow.taxDeferred = 0.25 * Math.max(0, parsed.escrow.gain || 0);
+      if (!parsed.managers) parsed.managers = [];
+      if (!parsed.mgrCandidates) parsed.mgrCandidates = [];
+      (parsed.properties || []).forEach(p => {
+        if (!p.flows) {
+          p.flows = [];
+          p.trackStart = parsed.month;
+          p.initialEquity = Math.max(0, (p.basis || 0) - (p.loan && p.loan.originalAmount || 0));
+          p.investedExtra = 0;
+          p.debtPaid = 0;
+          p.flowAdj = 0;
+        }
+      });
       parsed.properties.forEach(p => {
         if (!p.insurancePlan) p.insurancePlan = "standard";
       });
@@ -264,13 +383,63 @@ const TIER_TRANSITION_WEIGHTS = [[45, 35, 15, 5],
 [3, 12, 35, 50] // was Local / Unproven
 ];
 const weightedTier = () => weighted([10, 28, 37, 25]);
-const SURNAMES = ["Meridian", "Cornerstone", "Prairie", "Southfork", "Vantage", "Northgate", "Bluebonnet", "Trinity", "Red River", "Lakeside", "Silver Oak", "Longhorn", "Rahimi", "Okafor", "Delgado", "Kowalski", "Patel", "Nguyen"];
-const IG_NAMES = ["National Retail Corp.", "Sunbelt Convenience Holdings Inc.", "Consolidated Brands LLC", "American QSR Group Inc."];
+/* ============ NAME REGISTRY ============
+   Drop-in replaceable: swap these arrays with custom lists any time.
+   Names are generated on the fly (never stored beyond the tenant that holds them),
+   so bigger pools = more felt vastness at zero save-size cost. */
+const FIRST_MALE = ["Aaron", "Abraham", "Adam", "Adrian", "Albert", "Alexander", "Alfred", "Allan", "Allen", "Alvin", "Andrew", "Antonio", "Arthur", "August", "Austin", "Avery", "Ben", "Benjamin", "Bruce", "Bryant", "Bryon", "Calvin", "Carl", "Carlos", "Charles", "Christian", "Christopher", "Clark", "Clay", "Clayton", "Conrad", "Curtis", "Cyrus", "Dallas", "Daniel", "David", "Davis", "Dean", "Donald", "Douglas", "Edgar", "Edward", "Edwin", "Elias", "Elijah", "Elliott", "Ellis", "Emmett", "Eugene", "Evan", "Everett", "Felix", "Francis", "Frank", "Franklin", "Frederick", "Gabriel", "Garrett", "Grant", "Harley", "Harrison", "Harry", "Henry", "Hugh", "Isaac", "Israel", "Ivan", "Jack", "Jackson", "Jacob", "Jake", "James", "Jasper", "Jay", "Jefferson", "Jeremiah", "Jesse", "Joel", "John", "Jonathan", "Jose", "Joseph", "Joshua", "Juan", "Julian", "Julius", "Kenneth", "Lawrence", "Lee", "Leo", "Leon", "Leonard", "Levi", "Lewis", "Louis", "Luis", "Luke", "Malcolm", "Marcus", "Marshall", "Martin", "Marvin", "Mason", "Matthew", "Maurice", "Max", "Melvin", "Michael", "Miles", "Mitchell", "Morgan", "Nathaniel", "Neil", "Nelson", "Nicholas", "Noah", "Oliver", "Oscar", "Owen", "Patrick", "Paul", "Pedro", "Peter", "Phillip", "Preston", "Ramon", "Raymond", "Reuben", "Richard", "Riley", "Robert", "Rodney", "Roger", "Roy", "Russell", "Samuel", "Scott", "Seth", "Simon", "Solomon", "Spencer", "Stanley", "Stephen", "Sterling", "Steven", "Taylor", "Theodore", "Thomas", "Timothy", "Tony", "Troy", "Victor", "Vincent", "Wade", "Walter", "Warren", "Wayne", "Wesley", "William"];
+const FIRST_FEMALE = ["Olivia", "Emma", "Amelia", "Charlotte", "Mia", "Sophia", "Isabella", "Evelyn", "Ava", "Sofia", "Camila", "Harper", "Luna", "Eleanor", "Violet", "Aurora", "Elizabeth", "Eliana", "Hazel", "Chloe", "Ellie", "Nora", "Gianna", "Lily", "Emily", "Aria", "Scarlett", "Penelope", "Zoe", "Ella", "Avery", "Abigail", "Mila", "Lucy", "Ivy", "Layla", "Lainey", "Nova", "Grace", "Willow", "Riley", "Emilia", "Naomi", "Elena", "Madison", "Valentina", "Victoria", "Stella", "Delilah", "Maya", "Hannah", "Leah", "Lillian", "Genesis", "Josephine", "Sadie", "Adeline", "Zoey", "Sophie", "Paisley", "Alice", "Ruby", "Eloise", "Madelyn", "Leilani", "Claire", "Addison", "Ayla", "Emery", "Iris", "Eden", "Natalie", "Maria", "Maeve", "Daisy", "Vivian", "Clara", "Autumn", "Liliana", "Everly", "Audrey", "Lyla", "Jade", "Kinsley", "Millie", "Madeline", "Josie", "Kennedy", "Athena", "Melody", "Caroline", "Aaliyah", "Anna", "Sarah", "Quinn", "Lydia", "Lucia", "Allison", "Hailey"];
+const LAST_NAMES = ["Smith", "Jones", "Williams", "Taylor", "Brown", "Davies", "Evans", "Wilson", "Thomas", "Johnson", "Roberts", "Robinson", "Thompson", "Wright", "Walker", "White", "Edwards", "Hughes", "Green", "Hall", "Lewis", "Harris", "Clarke", "Patel", "Jackson", "Wood", "Turner", "Martin", "Cooper", "Hill", "Ward", "Morris", "Moore", "Clark", "Lee", "King", "Baker", "Harrison", "Morgan", "Allen", "James", "Scott", "Phillips", "Watson", "Davis", "Parker", "Price", "Bennett", "Young", "Griffiths", "Mitchell", "Kelly", "Cook", "Carter", "Richardson", "Bailey", "Collins", "Bell", "Shaw", "Murphy", "Miller", "Cox", "Richards", "Khan", "Marshall", "Anderson", "Simpson", "Ellis", "Adams", "Singh", "Begum", "Wilkinson", "Foster", "Chapman", "Powell", "Webb", "Rogers", "Gray", "Mason", "Ali", "Hunt", "Hussain", "Campbell", "Matthews", "Owen", "Palmer", "Holmes", "Mills", "Barnes", "Knight", "Lloyd", "Butler", "Russell", "Barker", "Fisher", "Stevens", "Jenkins", "Murray", "Dixon", "Harvey", "Graham", "Pearson", "Ahmed", "Fletcher", "Walsh", "Kaur", "Gibson", "Howard", "Andrews", "Stewart", "Elliott", "Reynolds", "Saunders", "Payne", "Fox", "Ford", "Pearce", "Day", "Brooks", "West", "Lawrence", "Cole", "Atkinson", "Bradley", "Spencer", "Gill", "Dawson", "Ball", "Burton", "O'Brien", "Watts", "Rose", "Booth", "Perry", "Ryan", "Grant", "Wells", "Armstrong", "Francis", "Rees", "Hayes", "Hart", "Hudson", "Newman", "Barrett", "Webster", "Hunter", "Gregory", "Carr", "Lowe", "Page", "Marsh", "Riley", "Dunn", "Woods", "Parsons", "Berry", "Stone", "Reid", "Holland", "Hawkins", "Harding", "Porter", "Robertson", "Newton", "Oliver", "Reed", "Kennedy", "Williamson", "Bird", "Gardner", "Shah", "Dean", "Lane", "Cooke", "Bates", "Henderson", "Parry", "Burgess", "Bishop", "Walton", "Burns", "Nicholson", "Shepherd", "Ross", "Cross", "Long", "Freeman", "Warren", "Nicholls", "Hamilton", "Byrne", "Sutton", "McDonald", "Yates", "Hodgson", "Robson", "Curtis", "Hopkins", "O'Connor", "Harper", "Coleman", "Watkins", "Moss", "McCarthy", "Chambers", "O'Neill", "Griffin", "Sharp", "Hardy", "Wheeler", "Potter", "Osborne", "Johnston", "Gordon", "Doyle", "Wallace", "George", "Jordan", "Hutchinson", "Rowe", "Burke", "May", "Pritchard", "Gilbert", "Willis", "Higgins", "Read", "Miles", "Stevenson", "Stephenson", "Hammond", "Arnold", "Buckley", "Walters", "Hewitt", "Barber", "Nelson", "Slater", "Austin", "Sullivan", "Whitehead", "Mann", "Frost", "Lambert", "Stephens", "Blake", "Akhtar", "Lynch", "Goodwin", "Barton", "Woodward", "Thomson", "Cunningham", "Quinn", "Barnett", "Baxter", "Bibi", "Clayton", "Nash", "Greenwood", "Jennings", "Holt", "Kemp", "Poole", "Gallagher", "Bond", "Stokes", "Tucker", "Davidson", "Fowler", "Heath", "Norman", "Middleton", "Lawson", "Banks", "French", "Stanley", "Jarvis", "Gibbs", "Ferguson", "Hayward", "Carroll", "Douglas", "Dickinson", "Todd", "Barlow", "Peters", "Lucas", "Knowles", "Hartley", "Miah", "Simmons", "Morton", "Alexander", "Field", "Morrison", "Norris", "Townsend", "Preston", "Hancock", "Thornton", "Baldwin", "Burrows", "Briggs", "Parkinson", "Reeves", "MacDonald", "Lamb", "Black", "Abbott", "Sanders", "Thorpe", "Holden", "Tomlinson", "Perkins", "Ashton", "Rhodes", "Fuller", "Howe", "Bryant", "Vaughan", "Dale", "Davey", "Weston", "Bartlett", "Whittaker", "Davison", "Kent", "Skinner", "Birch", "Morley", "Daniels", "Glover", "Howell", "Cartwright", "Pugh", "Humphreys", "Goddard", "Brennan", "Wall", "Kirby", "Bowen", "Savage", "Bull", "Wong", "Dobson", "Smart", "Wilkins", "Kirk", "Fraser", "Duffy", "Hicks", "Patterson", "Bradshaw", "Little", "Archer", "Warner", "Waters", "O'Sullivan", "Farrell", "Brookes", "Atkins", "Kay", "Dodd", "Bentley", "Flynn", "John", "Schofield", "Short", "Haynes", "Wade", "Butcher", "Henry", "Sanderson", "Crawford", "Sheppard", "Bolton", "Coates", "Giles", "Gould", "Houghton", "Gibbons", "Pratt", "Manning", "Law", "Hooper", "Noble", "Dyer", "Rahman", "Clements", "Moran", "Sykes", "Chan", "Doherty", "Connolly", "Joyce", "Franklin", "Hobbs", "Coles", "Herbert", "Steele", "Kerr", "Leach", "Winter", "Owens", "Duncan", "Naylor", "Fleming", "Horton", "Finch", "Fitzgerald", "Randall", "Carpenter", "Marsden", "Browne", "Garner", "Pickering", "Hale", "Dennis", "Vincent", "Chadwick", "Chandler", "Sharpe", "Nolan", "Lyons", "Hurst", "Collier", "Peacock", "Howarth", "Faulkner", "Rice", "Pollard", "Welch", "Norton", "Gough", "Sinclair", "Blackburn", "Bryan", "Conway", "Power", "Cameron", "Daly", "Allan", "Hanson", "Gardiner", "Boyle", "Myers", "Turnbull", "Wallis", "Mahmood", "Sims", "Swift", "Iqbal", "Pope", "Brady", "Chamberlain", "Rowley", "Tyler", "Farmer", "Metcalfe", "Hilton", "Godfrey", "Holloway", "Parkin", "Bray", "Talbot", "Donnelly", "Nixon", "Charlton", "Benson", "Whitehouse", "Barry", "Hope", "Lord", "North", "Storey", "Connor", "Potts", "Bevan", "Hargreaves", "McLean", "Mistry", "Bruce", "Howells", "Hyde", "Parkes", "Wyatt", "Fry", "Lees", "O'Donnell", "Craig", "Forster", "McKenzie", "Humphries", "Mellor", "Carey", "Ingram", "Summers", "Leonard"];
+
+/* ---- Company name generation: combinatorial for real variety ---- */
+const CO_GEO = ["Trinity", "Beltline", "Mockingbird", "Preston", "Lemmon", "Josey", "Coit", "Custer", "Legacy", "Stemmons", "Elm Fork", "White Rock", "Lone Star", "Bluebonnet", "Prairie", "Southfork", "Red River", "Silver Oak", "Longhorn", "Caprock", "Palo Duro", "Brazos", "Pecos", "Comal", "Guadalupe", "Frio", "Llano", "Sabine", "Neches", "Cibolo"];
+const CO_NATIONAL = ["National", "American", "United", "Consolidated", "Summit", "Pinnacle", "Meridian", "Cornerstone", "Vanguard", "Heritage", "Landmark", "Sterling", "Paramount", "Continental", "Interstate", "Atlas", "Beacon", "Crown", "Liberty", "Frontier"];
+const CO_SECTOR = ["Retail", "Convenience", "Commerce", "Brands", "QSR", "Restaurant", "Wellness", "Automotive", "Storage", "Logistics", "Hospitality", "Medical", "Dental", "Fitness", "Beverage", "Grocery", "Fuel", "Wash", "Salon", "Trade"];
+const CO_ENTITY_IG = ["Corp.", "Inc.", "Holdings Inc.", "Group Inc.", "Industries Inc.", "Companies Inc."];
+const CO_ENTITY_REG = ["Partners LLC", "Ventures LLC", "Commercial Group LLC", "Properties LLC", "Group LLC", "Associates LLC", "Capital LLC", "Management LLC"];
+const CO_CONCEPT = ["Grill", "Cafe", "Kitchen", "Cuts", "Cleaners", "Nails", "Smoothies", "Tacos", "Donuts", "Fitness", "Books", "Pets", "Vape", "Cellular", "Floral", "Games", "Threads", "Kicks", "Boba", "Wings"];
+const genPersonName = () => (Math.random() < 0.5 ? pick(FIRST_MALE) : pick(FIRST_FEMALE)) + " " + pick(LAST_NAMES);
+
+/* ============ PROPERTY MANAGERS ============
+   A manager's true skill (0.25–1.0) is HIDDEN at hire — you see a fee, a name,
+   and a reference blurb that only loosely correlates. Skill reveals itself
+   through outcomes: renewals, vacancy downtime, upkeep-driven appreciation,
+   and random events. A manager can run up to 3 properties in ONE city. */
+const MGR_CAP = 3;
+const cityOf = p => {
+  const parts = (p.sub || "").split("·");
+  return parts.length > 1 ? parts[parts.length - 1].trim().replace(", TX", "") : "DFW";
+};
+const mgrFor = (s, propId) => (s.managers || []).find(mg => mg.props.includes(propId)) || null;
+const MGR_BLURBS = [["References pending. Between opportunities right now.", "Managed a strip center that... changed hands recently.", "Enthusiastic. Résumé is one page, mostly hobbies."], ["Steady references from small landlords.", "Five years running a mixed portfolio, no complaints on file.", "Detail-oriented per two former employers."], ["Glowing references from a regional REIT.", "Ran 40 doors for a family office — they still send holiday cards.", "Tenants from a prior building asked if they could follow."]];
+const genMgrCandidate = () => {
+  const skill = 0.25 + Math.random() * 0.75;
+  // references loosely track skill — but ~15% of candidates interview far better or worse than they perform
+  const hint = Math.random() < 0.15 ? Math.floor(Math.random() * 3) : Math.max(0, Math.min(2, Math.round((skill + (Math.random() - 0.5) * 0.5) * 2 - 0.5)));
+  return {
+    id: "mgr" + Math.floor(Math.random() * 1e9),
+    name: genPersonName(),
+    feePct: 0.04 + Math.random() * 0.02,
+    skill,
+    blurb: pick(MGR_BLURBS[hint]),
+    rep: 3
+  };
+};
 const genTenantName = tierIdx => {
-  if (tierIdx === 0) return pick(IG_NAMES);
-  if (tierIdx === 1) return pick(SURNAMES) + " Retail Partners LLC";
-  if (tierIdx === 2) return pick(SURNAMES) + " Enterprises, dba operator";
-  return pick(SURNAMES) + " Family Holdings (DBA)";
+  if (tierIdx === 0) {
+    // Investment grade: corporate-flavored combinatorial names
+    return Math.random() < 0.5 ? pick(CO_NATIONAL) + " " + pick(CO_SECTOR) + " " + pick(CO_ENTITY_IG) : pick(CO_NATIONAL) + " " + pick(CO_GEO) + " " + pick(CO_SECTOR) + " " + pick(CO_ENTITY_IG);
+  }
+  if (tierIdx === 1) {
+    // Regional operator: geo or surname branded
+    return Math.random() < 0.5 ? pick(CO_GEO) + " " + pick(CO_SECTOR) + " " + pick(CO_ENTITY_REG) : pick(LAST_NAMES) + " " + pick(CO_SECTOR) + " " + pick(CO_ENTITY_REG);
+  }
+  if (tierIdx === 2) {
+    // Franchisee: a real person behind a concept
+    return genPersonName() + ", dba " + pick(CO_GEO) + " " + pick(CO_CONCEPT);
+  }
+  // Local / unproven: a person's name and a dream
+  return Math.random() < 0.5 ? genPersonName() + " (personal guarantee)" : pick(LAST_NAMES) + " Family " + pick(["Holdings", "Ventures", "Trust"]) + " (DBA)";
 };
 
 /* ============ PROPERTY TYPES (drive tax/insurance/risk/leverage/lease bias) ============ */
@@ -593,7 +762,7 @@ const REGIMES = {
     label: "Expansion",
     emoji: "🏗️",
     color: "#A8B5A6",
-    apprec: 0.02,
+    apprec: 0.04,
     renewAdj: 0,
     riskMult: 1,
     capShift: 0,
@@ -603,7 +772,7 @@ const REGIMES = {
     label: "Boom",
     emoji: "📈",
     color: "#7FBF9E",
-    apprec: 0.045,
+    apprec: 0.08,
     renewAdj: 0.05,
     riskMult: 0.7,
     capShift: -0.005,
@@ -675,6 +844,12 @@ const macarthur = () => ({
     floor: 0.0675,
     lender: "Prosperity Bank"
   },
+  initialEquity: 800000,
+  investedExtra: 0,
+  flows: [],
+  trackStart: 0,
+  debtPaid: 0,
+  flowAdj: 0,
   kabobs: {
     status: "occupied",
     rent: 4500,
@@ -693,6 +868,7 @@ const ACH_DEFS = {
   sniped: "🏃 Missed It — watched a hot deal get sniped",
   dealmaker: "🤝 Dealmaker — locked an early tenant extension",
   heloc: "🏛️ Leveraged Up — drew on the portfolio credit line",
+  delegator: "🧑‍💼 Delegator — hired your first property manager",
   flipper: "🔨 Flipper — stabilized a value-add deal",
   mogul: "👑 MacArthur Mogul — $100M net worth"
 };
@@ -728,6 +904,28 @@ function incomeOpexFor(p, m) {
   };
 }
 const earlyRenewCost = (p, m) => Math.round(p.grossRentBase * Math.pow(1.02, Math.max(0, m - p.boughtMonth) / 12) * 3);
+
+// Bank underwriting: player may put MORE down than the minimum and/or pick a SHORTER
+// amortization than the bank's max. Extra equity above the minimum earns a rate
+// concession (2bps per extra point of down payment, capped at 30bps).
+const underwrite = (d, downFrac, amortYears) => {
+  const minFrac = 1 - d.ltv;
+  const df = Math.min(1, Math.max(minFrac, downFrac || minFrac));
+  const rate = Math.max(0.03, d.rate - Math.min(0.003, Math.max(0, df - minFrac) * 0.02));
+  const amort = Math.min(amortYears || d.amortYears, d.amortYears);
+  const down = d.price * df;
+  const loanAmt = Math.max(0, d.price - down);
+  const payment = loanAmt > 0 ? pmtCalc(loanAmt, rate, amort) : 0;
+  return {
+    minFrac,
+    df,
+    rate,
+    amort,
+    down,
+    loanAmt,
+    payment
+  };
+};
 
 /* ============ MAIN APP ============ */
 function App() {
@@ -820,9 +1018,25 @@ function App() {
         body
       });
       for (let i = 0; i < n; i++) {
-        if (s.queue.length) break;
+        if (s.queue.length || s.dead) break;
         s.month += 1;
         const m = s.month;
+
+        /* ---- manager market refreshes quarterly ---- */
+        if (m % 3 === 0 || !s.mgrCandidates.length) s.mgrCandidates = [genMgrCandidate(), genMgrCandidate(), genMgrCandidate()];
+
+        /* ---- mortality: every month carries a small, age-weighted chance the run ends ---- */
+        {
+          const age = START_AGE + m / 12;
+          if (Math.random() < annualMortality(age) / 12) {
+            s.dead = {
+              age: Math.floor(age),
+              m
+            };
+            addLog(`💀 ${dateLabel(m)} — you died at age ${Math.floor(age)}. The empire passes to the estate.`, "bad");
+            break;
+          }
+        }
         if (s.reserve > 0) s.reserve *= 1 + s.treasury / 12;
 
         /* ---- portfolio credit line: interest-only at treasury + 3.50%, floating ---- */
@@ -868,16 +1082,16 @@ function App() {
               addLog("Boom flipped straight into recession.", "bad");
             }
           } else if (s.regime === "recession") {
-            if (rr < 0.07) {
+            if (rr < 0.08) {
               s.regime = "expansion";
               addLog("🌤️ Recession over — the market found its footing. Values and tenant health normalizing.", "good");
             }
           }
         }
         if (s.escrow && m > s.escrow.deadline) {
-          const tax = 0.25 * Math.max(0, s.escrow.gain);
+          const tax = Math.max(0, s.escrow.taxDeferred != null ? s.escrow.taxDeferred : 0.25 * Math.max(0, s.escrow.gain));
           s.cash += s.escrow.amount - tax;
-          addLog(`1031 window expired. Escrow released ${fmt(s.escrow.amount)} minus ${fmt(tax)} capital gains tax.`, "bad");
+          addLog(`1031 window expired. Escrow released ${fmt(s.escrow.amount)} minus ${fmt(tax)} deferred tax (recapture + gains + NIIT).`, "bad");
           s.escrow = null;
         }
         for (const p of s.properties) {
@@ -943,7 +1157,7 @@ function App() {
                   p.leaseMonthsLeft = randInt(tier.leaseTermYears[0], tier.leaseTermYears[1]) * 12;
                   p.grossRentBase *= 1.02;
                   addLog(`${p.tenantName} renewed on the locked extension at ${p.name} — ${Math.round(p.leaseMonthsLeft / 12)} more years, no drama.`, "good");
-                } else if (Math.random() > Math.min(0.99, Math.max(0.05, tier.renewalProb + reg.renewAdj))) vacated = true;else {
+                } else if (Math.random() > Math.min(0.99, Math.max(0.05, tier.renewalProb + reg.renewAdj + (mg ? (mg.skill - 0.5) * 0.25 : 0)))) vacated = true;else {
                   p.leaseMonthsLeft = randInt(tier.leaseTermYears[0], tier.leaseTermYears[1]) * 12;
                   p.grossRentBase *= 1.02;
                   addLog(`${p.tenantName} renewed at ${p.name} — locked in for another ${Math.round(p.leaseMonthsLeft / 12)} years.`, "good");
@@ -951,7 +1165,7 @@ function App() {
               } else if (Math.random() < tier.defaultRiskMo * reg.riskMult) vacated = true;
               if (vacated) {
                 p.status = "dark";
-                p.darkUntil = m + Math.max(2, Math.round(randInt(tier.downMonths[0], tier.downMonths[1]) * reg.downMult));
+                p.darkUntil = m + Math.max(2, Math.round(randInt(tier.downMonths[0], tier.downMonths[1]) * reg.downMult * (mg ? 1.25 - mg.skill * 0.5 : 1)));
                 alert(`🏚️ Tenant vacated — ${p.name}`, `${p.tenantName} (${tier.tier}) is out. NOI stops now; carrying costs continue until re-leased around ${dateLabel(p.darkUntil)}. Tenant credit strength predicted this risk.`);
                 addLog(`${p.tenantName} vacated ${p.name} — suite dark.`, "bad");
               }
@@ -971,6 +1185,7 @@ function App() {
               } else {
                 const tiCost = randInt(newTier.tiCost[0], newTier.tiCost[1]) * p.sqft;
                 s.cash -= tiCost;
+                p.flowAdj = (p.flowAdj || 0) - tiCost;
                 if (tiCost >= LARGE_EXPENSE) alert(`🔨 Re-leased — ${p.name}`, `${p.tenantName} (${newTier.tier}) signed. Tenant-improvement / leasing cost: ${fmtFull(tiCost)}, deducted now.`);else addLog(`${p.tenantName} (${newTier.tier}) signed at ${p.name}. TI cost ${fmt(tiCost)}.`, "good");
               }
               unlock("vacancy");
@@ -978,21 +1193,52 @@ function App() {
           }
 
           /* ---- financials: income, opex, debt service (unified for all properties) ---- */
-          const {
+          let {
             income,
             opex
           } = incomeOpexFor(p, m);
+          /* ---- property manager: fee off the top, and skill quietly shapes outcomes ---- */
+          const mg = mgrFor(s, p.id);
+          if (mg) {
+            if (income > 0) opex += income * mg.feePct;
+            // upkeep-driven value drift: a sharp manager compounds small gains; a poor one bleeds them
+            p.value *= 1 + (mg.skill - 0.5) * 0.012 / 12;
+            // rep drifts toward true skill with noise — stars slowly stop lying
+            mg.rep += (mg.skill * 5 - mg.rep) * 0.06 + (Math.random() - 0.5) * 0.12;
+            mg.rep = Math.max(0.5, Math.min(5, mg.rep));
+            // duality events: ~2%/mo, tail outcomes scale with skill
+            if (Math.random() < 0.02) {
+              if (mg.skill > 0.72) {
+                const save = Math.round(income * randRange(0.5, 1.5));
+                s.cash += save;
+                addLog(`🧑‍💼 ${mg.name} renegotiated vendor contracts at ${p.name}: +${fmt(save)}.`, "good");
+              } else if (mg.skill < 0.45) {
+                const hit = Math.round(p.value * randRange(0.002, 0.006));
+                s.cash -= hit;
+                p.value *= 0.997;
+                addLog(`🧑‍💼 ${mg.name} missed deferred maintenance at ${p.name}: −${fmt(hit)} emergency repair.`, "bad");
+              } else {
+                addLog(`🧑‍💼 ${mg.name} filed a clean quarterly report on ${p.name}. Nothing burning.`, "info");
+              }
+            }
+          }
           let ds = 0;
           if (p.loan.balance > 0) {
             const int = p.loan.balance * p.loan.rate / 12;
             const prin = Math.min(p.loan.payment - int, p.loan.balance);
             ds = int + Math.max(0, prin);
             p.loan.balance = Math.max(0, p.loan.balance - Math.max(0, prin));
+            p.debtPaid = (p.debtPaid || 0) + Math.max(0, prin);
             if (p.loan.balance === 0) {
               addLog(`${p.name} is FREE & CLEAR. ${fmt(p.loan.payment)}/mo debt service ends.`, "good");
               unlock("freeclear");
             }
           }
+          /* ---- performance ledger: this month's net cash flow, incl. one-off capital via flowAdj ---- */
+          if (!p.flows) p.flows = [];
+          p.flows.push(Math.round(income - opex - ds + (p.flowAdj || 0)));
+          p.flowAdj = 0;
+
           /* ---- DSCR covenant: six straight months below 1.10x triggers a lender cure demand ---- */
           if (p.loan.balance > 0 && p.loan.payment > 0) {
             const dscrNow = (income - opex) * 12 / (p.loan.payment * 12);
@@ -1025,7 +1271,7 @@ function App() {
               p.covenantMonths = 0;
             }
           }
-          p.value *= 1 + (reg.apprec + (Math.random() - 0.5) * 0.01) / 12;
+          p.value *= 1 + (reg.apprec + (Math.random() - 0.5) * 0.022) / 12;
           if (!Array.isArray(p.valueHistory)) p.valueHistory = [p.value];
           p.valueHistory.push(Math.round(p.value));
           if (p.valueHistory.length > 240) p.valueHistory = p.valueHistory.slice(-240);
@@ -1042,6 +1288,7 @@ function App() {
             const landlordAmt = Math.round(grossAmt * exposure * INS_PLANS[p.insurancePlan || "standard"].eventMult);
             if (landlordAmt >= 25) {
               s.cash -= landlordAmt;
+              p.flowAdj = (p.flowAdj || 0) - landlordAmt;
               if (landlordAmt >= LARGE_EXPENSE) {
                 alert(`🚨 Major expense — ${p.name}`, `${txt}: ${fmtFull(landlordAmt)} deducted from cash just now. (Lease structure absorbed the rest.) Check your reserves.`);
                 addLog(`${txt} at ${p.name}: −${fmt(landlordAmt)}.`, "bad");
@@ -1141,6 +1388,9 @@ function App() {
             if (paydown > 0 && paydown <= s.cash) {
               s.cash -= paydown;
               p.loan.balance -= paydown;
+              p.investedExtra = (p.investedExtra || 0) + paydown;
+              p.flowAdj = (p.flowAdj || 0) - paydown;
+              p.debtPaid = (p.debtPaid || 0) + paydown;
               p.loan.payment = pmtCalc(p.loan.balance, p.loan.rate, remYears);
               p.covenantGraceUntil = s.month + 12;
               logs.push({
@@ -1158,6 +1408,7 @@ function App() {
             }
           } else if (id === "cov-waiver") {
             const fee = Math.round(p.loan.balance * 0.005);
+            p.flowAdj = (p.flowAdj || 0) - fee;
             if (fee <= s.cash) {
               s.cash -= fee;
               p.covenantWaivedUntil = s.month + 12;
@@ -1205,6 +1456,9 @@ function App() {
       const applied = Math.min(amt, p.loan.balance);
       s.cash -= applied;
       p.loan.balance -= applied;
+      p.investedExtra = (p.investedExtra || 0) + applied;
+      p.flowAdj = (p.flowAdj || 0) - applied;
+      p.debtPaid = (p.debtPaid || 0) + applied;
       const logs = [{
         m: s.month,
         t: `Extra principal ${fmt(applied)} → ${p.name}. Balance now ${fmt(p.loan.balance)}. Payment unchanged (re-amortizes only at a reset).`,
@@ -1274,6 +1528,79 @@ function App() {
     });
     setResAmt("");
   };
+  const hireManager = candId => {
+    setG(prev => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const ci = s.mgrCandidates.findIndex(c => c.id === candId);
+      if (ci < 0) return prev;
+      const c = s.mgrCandidates.splice(ci, 1)[0];
+      s.managers.push({
+        ...c,
+        props: [],
+        city: null,
+        hiredMonth: s.month
+      });
+      s.log = [{
+        m: s.month,
+        t: `Hired ${c.name} as a property manager — ${(c.feePct * 100).toFixed(1)}% of collected rent. Assign properties to put them to work.`,
+        k: "good"
+      }, ...s.log].slice(0, 70);
+      if (!s.ach.includes("delegator")) {
+        s.ach.push("delegator");
+        s.log = [{
+          m: s.month,
+          t: ACH_DEFS.delegator,
+          k: "ach"
+        }, ...s.log].slice(0, 70);
+      }
+      return s;
+    });
+  };
+  const fireManager = mgId => {
+    setG(prev => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const mi = s.managers.findIndex(x => x.id === mgId);
+      if (mi < 0) return prev;
+      const mg = s.managers[mi];
+      // severance: one month of fees on managed income
+      const sev = Math.round(mg.props.reduce((a, pid) => {
+        const p = s.properties.find(x => x.id === pid);
+        if (!p) return a;
+        const {
+          income
+        } = incomeOpexFor(p, s.month);
+        return a + income * mg.feePct;
+      }, 0));
+      s.cash -= sev;
+      s.managers.splice(mi, 1);
+      s.log = [{
+        m: s.month,
+        t: `Let ${mg.name} go${sev > 0 ? ` — ${fmt(sev)} severance` : ""}. Their properties are self-managed again.`,
+        k: "warn"
+      }, ...s.log].slice(0, 70);
+      return s;
+    });
+  };
+  const toggleAssign = (mgId, propId) => {
+    setG(prev => {
+      const s = JSON.parse(JSON.stringify(prev));
+      const mg = s.managers.find(x => x.id === mgId);
+      const p = s.properties.find(x => x.id === propId);
+      if (!mg || !p) return prev;
+      if (mg.props.includes(propId)) {
+        mg.props = mg.props.filter(x => x !== propId);
+        if (!mg.props.length) mg.city = null;
+      } else {
+        if (mg.props.length >= MGR_CAP) return prev;
+        if (mgrFor(s, propId)) return prev; // already managed by someone
+        const c = cityOf(p);
+        if (mg.city && mg.city !== c) return prev; // one city per manager
+        mg.city = c;
+        mg.props.push(propId);
+      }
+      return s;
+    });
+  };
   const sellProp = (propId, mode) => {
     setG(prev => {
       const s = JSON.parse(JSON.stringify(prev));
@@ -1281,29 +1608,34 @@ function App() {
       if (idx < 0) return prev;
       const p = s.properties[idx];
       const proceeds = p.value * 0.95 - p.loan.balance;
-      const gain = Math.max(0, p.value - p.basis);
+      const held = s.month - (p.boughtMonth || 0);
+      const stax = saleTax(p.basis, p.value, held);
       const logs = [];
       if (mode === "cash") {
-        const tax = 0.25 * gain;
-        s.cash += proceeds - tax;
+        s.cash += proceeds - stax.total;
         logs.push({
           m: s.month,
-          t: `Sold ${p.name} for ${fmt(p.value)}. Net after loan, 5% costs & ${fmt(tax)} tax: +${fmt(proceeds - tax)}.`,
+          t: `Sold ${p.name} for ${fmt(p.value)}. Tax: ${fmt(stax.recaptureTax)} recapture + ${fmt(stax.ltcgTax)} LTCG + ${fmt(stax.niitTax)} NIIT = ${fmt(stax.total)}. Net: +${fmt(proceeds - stax.total)}.`,
           k: "good"
         });
       } else {
         s.escrow = {
           amount: (s.escrow ? s.escrow.amount : 0) + proceeds,
-          gain: (s.escrow ? s.escrow.gain : 0) + gain,
+          gain: (s.escrow ? s.escrow.gain : 0) + stax.totalGain,
+          taxDeferred: (s.escrow && s.escrow.taxDeferred ? s.escrow.taxDeferred : 0) + stax.total,
           deadline: s.month + 6
         };
         logs.push({
           m: s.month,
-          t: `Sold ${p.name} via 1031. ${fmt(proceeds)} in exchange escrow — buy within 6 months or pay tax.`,
+          t: `Sold ${p.name} via 1031. ${fmt(proceeds)} to escrow — ${fmt(stax.total)} of tax deferred. Buy within 6 months or it comes due.`,
           k: "warn"
         });
       }
       s.properties.splice(idx, 1);
+      (s.managers || []).forEach(mg => {
+        mg.props = mg.props.filter(x => x !== propId);
+        if (!mg.props.length) mg.city = null;
+      });
       s.log = [...logs, ...s.log].slice(0, 70);
       return s;
     });
@@ -1312,7 +1644,7 @@ function App() {
 
   // escrowOverride: how much of the 1031 escrow the player chooses to put into this deal.
   // Can exceed the lender's minimum down payment — the surplus reduces the loan instead of sitting idle.
-  const buyDeal = (dealId, escrowOverride) => {
+  const buyDeal = (dealId, escrowOverride, downFrac, amortChoice) => {
     setG(prev => {
       const s = JSON.parse(JSON.stringify(prev));
       const di = s.market.findIndex(d => d.id === dealId);
@@ -1322,8 +1654,11 @@ function App() {
         closing = d.price * 0.02;
       const escrowAvail = s.escrow ? s.escrow.amount : 0;
       const escrowUsed = Math.max(0, Math.min(escrowOverride ?? Math.min(escrowAvail, minDown), escrowAvail, d.price));
-      const effectiveDown = Math.max(minDown, escrowUsed);
-      const loanAmt = d.price - effectiveDown;
+      // player-chosen down payment, but escrow already committed can push it higher, never lower than bank minimum
+      const chosenDown = Math.max(d.price * (downFrac || 1 - d.ltv), escrowUsed);
+      const uw = underwrite(d, chosenDown / d.price, amortChoice);
+      const effectiveDown = uw.down;
+      const loanAmt = uw.loanAmt;
       const fromCashForDown = Math.max(0, effectiveDown - escrowUsed);
       const fromCash = fromCashForDown + closing;
       if (fromCash > s.cash) return prev;
@@ -1356,6 +1691,12 @@ function App() {
         sqft: d.sqft,
         basis: d.price,
         value: d.price,
+        initialEquity: effectiveDown + closing,
+        investedExtra: 0,
+        flows: [],
+        trackStart: s.month,
+        debtPaid: 0,
+        flowAdj: 0,
         boughtMonth: s.month,
         tenantName: d.tenantName,
         tierIdx: d.tierIdx,
@@ -1379,11 +1720,11 @@ function App() {
         loan: {
           balance: loanAmt,
           originalAmount: loanAmt,
-          rate: d.rate,
-          originRate: d.rate,
-          payment: pmtCalc(loanAmt, d.rate, d.amortYears),
+          rate: uw.rate,
+          originRate: uw.rate,
+          payment: uw.payment,
           originMonth: s.month,
-          amortYears: d.amortYears,
+          amortYears: uw.amort,
           resets: [],
           floor: 0,
           lender: "Market Debt"
@@ -1393,7 +1734,7 @@ function App() {
       const downPct = Math.round(effectiveDown / d.price * 100);
       logs.unshift({
         m: s.month,
-        t: `Acquired ${d.name} for ${fmt(d.price)} — ${fmt(effectiveDown)} down (${downPct}%${escrowUsed > 0 ? `, ${fmt(escrowUsed)} from 1031 escrow` : ""}) + ${fmt(closing)} closing, ${(d.rate * 100).toFixed(2)}% loan on ${fmt(loanAmt)}, ${LEASE_TYPES[d.leaseTypeIdx].code} lease. Tenant: ${d.tenantName} (${CREDIT_TIERS[d.tierIdx].tier}).`,
+        t: `Acquired ${d.name} for ${fmt(d.price)} — ${fmt(effectiveDown)} down (${downPct}%${escrowUsed > 0 ? `, ${fmt(escrowUsed)} from 1031 escrow` : ""}) + ${fmt(closing)} closing${loanAmt > 0 ? `, ${(uw.rate * 100).toFixed(2)}% loan on ${fmt(loanAmt)}, ${uw.amort}-yr am` : ", ALL CASH"}, ${LEASE_TYPES[d.leaseTypeIdx].code} lease. Tenant: ${d.tenantName} (${CREDIT_TIERS[d.tierIdx].tier}).`,
         k: "good"
       });
       if (s.properties.length >= 3 && !s.ach.includes("empire")) {
@@ -1509,6 +1850,8 @@ function App() {
       p.needsRehab = false;
       p.stabilizeOnLease = true;
       p.darkUntil = s.month + randInt(3, 6);
+      p.investedExtra = (p.investedExtra || 0) + p.rehabCost;
+      p.flowAdj = (p.flowAdj || 0) - p.rehabCost;
       s.log = [{
         m: s.month,
         t: `🔨 Rehab funded at ${p.name} — ${fmt(p.rehabCost)} into the buildout. Broker is marketing the space; lease-up est. ${dateLabel(p.darkUntil)}.`,
@@ -1716,7 +2059,68 @@ function App() {
       border: "none",
       borderRadius: 8
     }
-  }, "KEEP BUILDING ▸"))), /*#__PURE__*/React.createElement("div", {
+  }, "KEEP BUILDING ▸"))), g.dead && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(4,8,6,0.94)",
+      zIndex: 110
+    },
+    className: "flex items-center justify-center p-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      animation: "popIn .6s ease both",
+      background: C.felt2,
+      border: `2px solid ${C.line}`,
+      borderRadius: 16,
+      padding: 32,
+      textAlign: "center",
+      maxWidth: 440
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 56
+    }
+  }, "🪦"), /*#__PURE__*/React.createElement("div", {
+    className: "disp font-extrabold text-3xl mt-2",
+    style: {
+      color: C.ink
+    }
+  }, "HERE LIES A MOGUL"), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-sm mt-2",
+    style: {
+      color: C.inkDim
+    }
+  }, dateLabel(g.dead.m), " · age ", g.dead.age, " · ", Math.floor(g.dead.m / 12), " years in the game"), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-sm mt-3",
+    style: {
+      color: C.brass
+    }
+  }, "Final net worth: ", fmt(netWorth)), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs mt-1",
+    style: {
+      color: C.inkDim
+    }
+  }, g.properties.length, " propert", g.properties.length === 1 ? "y" : "ies", " · ", g.ach.length, "/12 achievements", g.goalHit ? " · DIED A MOGUL 👑" : ""), /*#__PURE__*/React.createElement("div", {
+    className: "text-xs mt-3",
+    style: {
+      color: C.inkDim
+    }
+  }, g.goalHit ? "You made it to $100M before the end. The empire outlives you." : "The buildings stand. The loans amortize. Life, however, does not."), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      try {
+        localStorage.removeItem(SAVE_KEY);
+      } catch (e) {}
+      window.location.reload();
+    },
+    className: "disp font-extrabold px-5 py-2 mt-4",
+    style: {
+      background: C.brass,
+      color: "#1A1408",
+      border: "none",
+      borderRadius: 8
+    }
+  }, "🌅 START A NEW LIFE"))), /*#__PURE__*/React.createElement("div", {
     className: "safe-top",
     style: {
       borderBottom: `1px solid ${C.line}`,
@@ -1748,7 +2152,7 @@ function App() {
       display: "inline-block",
       animation: "fadeInUp .3s ease both"
     }
-  }, dateLabel(g.month)), " · 5Y UST ", (g.treasury * 100).toFixed(2), "% · ", /*#__PURE__*/React.createElement("span", {
+  }, dateLabel(g.month)), " · AGE ", Math.floor(START_AGE + g.month / 12), " · 5Y UST ", (g.treasury * 100).toFixed(2), "% · ", /*#__PURE__*/React.createElement("span", {
     style: {
       color: (REGIMES[g.regime] || REGIMES.expansion).color
     }
@@ -1846,6 +2250,28 @@ function App() {
       borderRadius: 6
     }
   }, "🏛️ CREDIT LINE"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal({
+      type: "perf"
+    }),
+    className: "mono text-xs px-3 py-1.5",
+    style: {
+      background: C.felt3,
+      color: C.sprout,
+      border: `1px solid ${C.sprout}`,
+      borderRadius: 6
+    }
+  }, "📊 PERFORMANCE"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setModal({
+      type: "managers"
+    }),
+    className: "mono text-xs px-3 py-1.5",
+    style: {
+      background: C.felt3,
+      color: "#C9A9E8",
+      border: `1px solid #C9A9E8`,
+      borderRadius: 6
+    }
+  }, "🧑‍💼 MANAGERS", g.managers.length ? ` (${g.managers.length})` : ""), /*#__PURE__*/React.createElement("button", {
     onClick: newGame,
     className: "mono text-xs px-3 py-1.5",
     style: {
@@ -1862,19 +2288,22 @@ function App() {
     }
   }, "💾 saved to this device"), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 w-full sm:w-auto sm:ml-auto"
-  }, [1, 6, 12].map(n => /*#__PURE__*/React.createElement("button", {
-    key: n,
-    onClick: () => runMonths(n),
-    disabled: g.queue.length > 0,
-    className: "disp font-extrabold px-2 sm:px-3 py-2 text-sm md:text-base flex-1 sm:flex-none whitespace-nowrap",
-    style: {
-      background: g.queue.length > 0 ? C.felt3 : C.brass,
-      color: g.queue.length > 0 ? C.inkDim : "#1A1408",
-      borderRadius: 6,
-      border: "none",
-      opacity: g.queue.length > 0 ? 0.6 : 1
-    }
-  }, "ADVANCE +", n, "MO ▸")))))), top && /*#__PURE__*/React.createElement("div", {
+  }, [1, 6, 12].map(n => {
+    const locked = g.queue.length > 0 || !!g.dead;
+    return /*#__PURE__*/React.createElement("button", {
+      key: n,
+      onClick: () => runMonths(n),
+      disabled: locked,
+      className: "disp font-extrabold px-2 sm:px-3 py-2 text-sm md:text-base flex-1 sm:flex-none whitespace-nowrap",
+      style: {
+        background: locked ? C.felt3 : C.brass,
+        color: locked ? C.inkDim : "#1A1408",
+        borderRadius: 6,
+        border: "none",
+        opacity: locked ? 0.6 : 1
+      }
+    }, "ADVANCE +", n, "MO ▸");
+  }))))), top && /*#__PURE__*/React.createElement("div", {
     className: "max-w-5xl mx-auto px-4 mt-4"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1940,6 +2369,7 @@ function App() {
   }, /*#__PURE__*/React.createElement(PropertyCard, {
     p: p,
     month: g.month,
+    mgr: mgrFor(g, p.id),
     onLoan: () => setModal({
       type: "loan",
       propId: p.id
@@ -2017,7 +2447,7 @@ function App() {
       color: C.inkDim
     }
   }, dateLabel(l.m), " · "), l.t)))), g.ach.length > 0 && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(SectionHead, {
-    label: `ACHIEVEMENTS · ${g.ach.length}/11`
+    label: `ACHIEVEMENTS · ${g.ach.length}/12`
   }), /*#__PURE__*/React.createElement("div", {
     className: "mt-2 flex flex-col gap-1"
   }, g.ach.map(a => /*#__PURE__*/React.createElement("div", {
@@ -2094,6 +2524,15 @@ function App() {
     resAmt: resAmt,
     setResAmt: setResAmt,
     transferReserve: transferReserve,
+    close: () => setModal(null)
+  }), modal.type === "managers" && /*#__PURE__*/React.createElement(ManagersModal, {
+    g: g,
+    hireManager: hireManager,
+    fireManager: fireManager,
+    toggleAssign: toggleAssign,
+    close: () => setModal(null)
+  }), modal.type === "perf" && /*#__PURE__*/React.createElement(PerfModal, {
+    g: g,
     close: () => setModal(null)
   }))), /*#__PURE__*/React.createElement("div", {
     className: "max-w-5xl mx-auto px-4 mono text-xs",
@@ -2302,6 +2741,7 @@ function LeaseBadge({
 function PropertyCard({
   p,
   month,
+  mgr,
   onLoan,
   onRefi,
   onTenants,
@@ -2374,7 +2814,18 @@ function PropertyCard({
       padding: "1px 5px",
       whiteSpace: "nowrap"
     }
-  }, "🛡 ", INS_PLANS[p.insurancePlan || "standard"].short), p.isMac ? /*#__PURE__*/React.createElement("span", {
+  }, "🛡 ", INS_PLANS[p.insurancePlan || "standard"].short), mgr && /*#__PURE__*/React.createElement("span", {
+    className: "mono",
+    title: mgr.name,
+    style: {
+      fontSize: 9,
+      color: "#C9A9E8",
+      border: `1px solid #C9A9E8`,
+      borderRadius: 4,
+      padding: "1px 5px",
+      whiteSpace: "nowrap"
+    }
+  }, "🧑‍💼 ", "★".repeat(Math.max(1, Math.round(mgr.rep)))), p.isMac ? /*#__PURE__*/React.createElement("span", {
     className: "mono",
     style: {
       fontSize: 9,
@@ -3657,8 +4108,10 @@ function SellModal({
   const p = g.properties.find(x => x.id === modal.propId);
   if (!p) return null;
   const proceeds = p.value * 0.95 - p.loan.balance;
-  const gain = Math.max(0, p.value - p.basis);
-  const tax = 0.25 * gain;
+  const held = g.month - (p.boughtMonth || 0);
+  const stax = saleTax(p.basis, p.value, held);
+  const tax = stax.total;
+  const effRate = stax.totalGain > 0 ? tax / stax.totalGain * 100 : 0;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "disp text-xl font-extrabold",
     style: {
@@ -3669,15 +4122,47 @@ function SellModal({
     style: {
       color: C.ink
     }
-  }, /*#__PURE__*/React.createElement("div", null, "Sale price (value): ", /*#__PURE__*/React.createElement("b", null, fmtFull(p.value))), /*#__PURE__*/React.createElement("div", null, "Less 5% costs: −", fmtFull(p.value * 0.05)), /*#__PURE__*/React.createElement("div", null, "Less loan payoff: −", fmtFull(p.loan.balance)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.sprout
-    }
-  }, "Net proceeds: ", /*#__PURE__*/React.createElement("b", null, fmtFull(proceeds))), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "Sale price"), /*#__PURE__*/React.createElement("span", null, fmtFull(p.value))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
     style: {
       color: C.inkDim
     }
-  }, "Taxable gain ", fmtFull(gain), " → tax ", fmtFull(tax), " if cashing out")), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "Less 5% selling costs"), /*#__PURE__*/React.createElement("span", null, "−", fmtFull(p.value * 0.05))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
+    style: {
+      color: C.inkDim
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Less loan payoff"), /*#__PURE__*/React.createElement("span", null, "−", fmtFull(p.loan.balance))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
+    style: {
+      color: C.sprout
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Net proceeds"), /*#__PURE__*/React.createElement("b", null, fmtFull(proceeds))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 pt-2",
+    style: {
+      borderTop: `1px dashed ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim,
+      marginBottom: 2
+    }
+  }, "IF CASHING OUT — TAX ON ", fmtFull(stax.totalGain), " GAIN (held ", (held / 12).toFixed(1), "yr)"), stax.recaptureTax > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "§1250 recapture (25%)"), /*#__PURE__*/React.createElement("span", null, fmtFull(stax.recaptureTax))), stax.ltcgTax > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "Cap gains (20%)"), /*#__PURE__*/React.createElement("span", null, fmtFull(stax.ltcgTax))), stax.niitTax > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "NIIT (3.8%)"), /*#__PURE__*/React.createElement("span", null, fmtFull(stax.niitTax))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
+    style: {
+      color: C.flare
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Total tax (", effRate.toFixed(1), "% eff.)"), /*#__PURE__*/React.createElement("b", null, fmtFull(tax))))), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-col gap-2 mt-4"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => sellProp(p.id, "cash"),
@@ -3707,6 +4192,385 @@ function SellModal({
     }
   }, "Never mind")));
 }
+function PerfModal({
+  g,
+  close
+}) {
+  const rows = g.properties.map(p => ({
+    p,
+    perf: propPerf(p, g.month)
+  }));
+  const invested = rows.reduce((a, r) => a + r.perf.invested, 0);
+  const cumCF = rows.reduce((a, r) => a + r.perf.cumCF, 0);
+  const apprec = rows.reduce((a, r) => a + r.perf.apprec, 0);
+  const paydown = rows.reduce((a, r) => a + r.perf.paydown, 0);
+  const terminal = rows.reduce((a, r) => a + r.perf.terminal, 0);
+  const eqMult = invested > 0 ? (cumCF + terminal) / invested : 0;
+  // blended IRR: merge every property's flow ledger onto one absolute-month axis
+  const blended = (() => {
+    if (!rows.length) return null;
+    const start = Math.min(...rows.map(r => r.p.trackStart != null ? r.p.trackStart : r.p.boughtMonth || 0));
+    const arr = new Array(g.month - start + 1).fill(0);
+    rows.forEach(({
+      p,
+      perf
+    }) => {
+      const t0 = p.trackStart != null ? p.trackStart : p.boughtMonth || 0;
+      arr[t0 - start] -= p.initialEquity || 0;
+      (p.flows || []).forEach((f, i) => {
+        const k = t0 - start + 1 + i;
+        if (k < arr.length) arr[k] += f;
+      });
+      arr[arr.length - 1] += perf.terminal;
+    });
+    return irrFromFlows(arr);
+  })();
+  const totalReturn = cumCF + apprec + paydown;
+  const seg = v => totalReturn > 0 ? Math.max(0, v / totalReturn * 100) : 0;
+  const pct = v => v == null ? "—" : (v * 100).toFixed(1) + "%";
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "disp text-xl font-extrabold",
+    style: {
+      color: C.sprout
+    }
+  }, "📊 Performance"), /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim,
+      marginTop: 2
+    }
+  }, "IRR assumes a net sale today: 95% of value, less debt, less recapture/LTCG/NIIT. The honest number."), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3",
+    style: {
+      background: C.felt3,
+      borderRadius: 8,
+      padding: 12,
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs",
+    style: {
+      color: C.inkDim,
+      letterSpacing: "0.08em",
+      marginBottom: 6
+    }
+  }, "PORTFOLIO"), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-x-5 gap-y-2"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim
+    }
+  }, "BLENDED IRR"), /*#__PURE__*/React.createElement("div", {
+    className: "disp text-lg font-extrabold",
+    style: {
+      color: blended != null && blended >= 0 ? C.sprout : C.flare
+    }
+  }, pct(blended))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim
+    }
+  }, "EQUITY MULTIPLE"), /*#__PURE__*/React.createElement("div", {
+    className: "disp text-lg font-extrabold",
+    style: {
+      color: C.brass
+    }
+  }, eqMult.toFixed(2), "x")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim
+    }
+  }, "INVESTED"), /*#__PURE__*/React.createElement("div", {
+    className: "disp text-lg font-extrabold",
+    style: {
+      color: C.ink
+    }
+  }, fmt(invested)))), totalReturn > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim,
+      marginBottom: 4
+    }
+  }, "TOTAL RETURN ", fmt(totalReturn), " — WHERE IT CAME FROM"), /*#__PURE__*/React.createElement("div", {
+    className: "flex w-full",
+    style: {
+      height: 14,
+      borderRadius: 7,
+      overflow: "hidden",
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: seg(cumCF) + "%",
+      background: C.sprout
+    },
+    title: "Cash flow"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: seg(apprec) + "%",
+      background: C.brass
+    },
+    title: "Appreciation"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: seg(paydown) + "%",
+      background: "#8FC7D9"
+    },
+    title: "Principal paydown"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-4 mt-1 flex-wrap mono",
+    style: {
+      fontSize: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.sprout
+    }
+  }, "■ Cash flow ", fmt(cumCF)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.brass
+    }
+  }, "■ Appreciation ", fmt(apprec)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#8FC7D9"
+    }
+  }, "■ Paydown ", fmt(paydown))))), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs mt-3",
+    style: {
+      color: C.inkDim,
+      letterSpacing: "0.08em"
+    }
+  }, "BY PROPERTY"), rows.map(({
+    p,
+    perf
+  }) => /*#__PURE__*/React.createElement("div", {
+    key: p.id,
+    className: "mt-2",
+    style: {
+      background: C.felt3,
+      borderRadius: 8,
+      padding: 10,
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-sm",
+    style: {
+      color: C.ink,
+      fontWeight: 700,
+      minWidth: 0,
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap"
+    }
+  }, p.emoji, " ", p.name), /*#__PURE__*/React.createElement("div", {
+    className: "disp font-extrabold",
+    style: {
+      color: perf.irr != null && perf.irr >= 0 ? C.sprout : C.flare
+    }
+  }, pct(perf.irr), /*#__PURE__*/React.createElement("span", {
+    className: "mono",
+    style: {
+      fontSize: 9,
+      color: C.inkDim
+    }
+  }, " IRR"))), /*#__PURE__*/React.createElement("div", {
+    className: "mono flex flex-wrap gap-x-4 gap-y-1 mt-1",
+    style: {
+      fontSize: 10,
+      color: C.inkDim
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "CoC ", pct(perf.coc)), /*#__PURE__*/React.createElement("span", null, "Multiple ", perf.eqMult.toFixed(2), "x"), /*#__PURE__*/React.createElement("span", null, "In ", fmt(perf.invested)), /*#__PURE__*/React.createElement("span", null, "CF ", fmt(perf.cumCF)), /*#__PURE__*/React.createElement("span", null, "Held ", (perf.held / 12).toFixed(1), "yr"), p.trackStart > (p.boughtMonth || 0) && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "since tracking began")))), !rows.length && /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs mt-2",
+    style: {
+      color: C.inkDim
+    }
+  }, "No properties yet."), /*#__PURE__*/React.createElement("button", {
+    onClick: close,
+    className: "mono text-xs px-3 py-1.5 mt-3",
+    style: {
+      background: "transparent",
+      color: C.inkDim,
+      border: "none"
+    }
+  }, "Close"));
+}
+function ManagersModal({
+  g,
+  hireManager,
+  fireManager,
+  toggleAssign,
+  close
+}) {
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "disp text-xl font-extrabold",
+    style: {
+      color: "#C9A9E8"
+    }
+  }, "🧑‍💼 Property Managers"), /*#__PURE__*/React.createElement("div", {
+    className: "text-xs mt-1",
+    style: {
+      color: C.inkDim
+    }
+  }, "A manager takes their fee off collected rent, but a good one earns it back: better renewals, faster lease-ups, a building that quietly appreciates. A bad one... you'll find out. References only tell you so much — the stars drift toward the truth over time. One city per manager, up to ", MGR_CAP, " properties."), g.managers.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs",
+    style: {
+      color: C.inkDim,
+      letterSpacing: "0.08em",
+      marginBottom: 6
+    }
+  }, "YOUR TEAM"), g.managers.map(mg => {
+    const stars = "★".repeat(Math.max(1, Math.round(mg.rep))) + "☆".repeat(Math.max(0, 5 - Math.max(1, Math.round(mg.rep))));
+    const feeMo = Math.round(mg.props.reduce((a, pid) => {
+      const p = g.properties.find(x => x.id === pid);
+      if (!p) return a;
+      const {
+        income
+      } = incomeOpexFor(p, g.month);
+      return a + income * mg.feePct;
+    }, 0));
+    return /*#__PURE__*/React.createElement("div", {
+      key: mg.id,
+      className: "mb-3",
+      style: {
+        background: C.felt3,
+        borderRadius: 8,
+        padding: 10,
+        border: `1px solid ${C.line}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center justify-between"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+      className: "mono text-sm",
+      style: {
+        color: C.ink,
+        fontWeight: 700
+      }
+    }, mg.name), /*#__PURE__*/React.createElement("span", {
+      className: "mono text-xs",
+      style: {
+        color: "#C9A9E8",
+        marginLeft: 8
+      }
+    }, stars)), /*#__PURE__*/React.createElement("button", {
+      onClick: () => fireManager(mg.id),
+      className: "mono px-2 py-1",
+      style: {
+        fontSize: 10,
+        background: "transparent",
+        color: C.flare,
+        border: `1px solid ${C.flare}`,
+        borderRadius: 4
+      }
+    }, "FIRE")), /*#__PURE__*/React.createElement("div", {
+      className: "mono text-xs mt-1",
+      style: {
+        color: C.inkDim
+      }
+    }, (mg.feePct * 100).toFixed(1), "% of rent", mg.city ? ` · ${mg.city}` : " · no city yet", " · ", mg.props.length, "/", MGR_CAP, " properties", feeMo > 0 ? ` · ~${fmt(feeMo)}/mo fees` : ""), /*#__PURE__*/React.createElement("div", {
+      className: "flex gap-1 mt-2 flex-wrap"
+    }, g.properties.map(p => {
+      const assigned = mg.props.includes(p.id);
+      const otherMgr = !assigned && mgrFor(g, p.id);
+      const cityBlock = !assigned && mg.city && cityOf(p) !== mg.city;
+      const full = !assigned && mg.props.length >= MGR_CAP;
+      const blocked = otherMgr || cityBlock || full;
+      return /*#__PURE__*/React.createElement("button", {
+        key: p.id,
+        onClick: () => !blocked && toggleAssign(mg.id, p.id),
+        disabled: !!blocked,
+        title: otherMgr ? `Managed by ${otherMgr.name}` : cityBlock ? `${mg.name} works ${mg.city} only` : full ? "At capacity" : "",
+        className: "mono px-2 py-1",
+        style: {
+          fontSize: 10,
+          background: assigned ? "#3A2E4A" : C.felt2,
+          color: assigned ? "#C9A9E8" : blocked ? C.inkDim : C.ink,
+          border: `1px solid ${assigned ? "#C9A9E8" : C.line}`,
+          borderRadius: 4,
+          opacity: blocked ? 0.45 : 1
+        }
+      }, p.emoji, " ", cityOf(p), assigned ? " ✓" : "");
+    })));
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs",
+    style: {
+      color: C.inkDim,
+      letterSpacing: "0.08em",
+      marginBottom: 6
+    }
+  }, "ON THE MARKET · refreshes quarterly"), (g.mgrCandidates || []).map(c => /*#__PURE__*/React.createElement("div", {
+    key: c.id,
+    className: "mb-2 flex items-center justify-between gap-2",
+    style: {
+      background: C.felt3,
+      borderRadius: 8,
+      padding: 10,
+      border: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-sm",
+    style: {
+      color: C.ink,
+      fontWeight: 700
+    }
+  }, c.name, " ", /*#__PURE__*/React.createElement("span", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.gold
+    }
+  }, (c.feePct * 100).toFixed(1), "% fee")), /*#__PURE__*/React.createElement("div", {
+    className: "text-xs",
+    style: {
+      color: C.inkDim,
+      fontStyle: "italic"
+    }
+  }, "\"", c.blurb, "\"")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => hireManager(c.id),
+    className: "disp font-extrabold px-3 py-1.5",
+    style: {
+      background: "#C9A9E8",
+      color: "#241A30",
+      border: "none",
+      borderRadius: 6,
+      whiteSpace: "nowrap"
+    }
+  }, "HIRE"))), !(g.mgrCandidates || []).length && /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs",
+    style: {
+      color: C.inkDim
+    }
+  }, "No candidates right now — advance a month.")), /*#__PURE__*/React.createElement("button", {
+    onClick: close,
+    className: "mono text-xs px-3 py-1.5 mt-3",
+    style: {
+      background: "transparent",
+      color: C.inkDim,
+      border: "none"
+    }
+  }, "Close"));
+}
 function OMModal({
   g,
   modal,
@@ -3717,18 +4581,29 @@ function OMModal({
 }) {
   const d = g.market.find(x => x.id === modal.dealId);
   if (!d) return null;
+  const minPctInit = Math.ceil((1 - d.ltv) * 100);
+  const [downPctUI, setDownPctUI] = useState(minPctInit);
+  const [amortUI, setAmortUI] = useState(d.amortYears);
   const t = CREDIT_TIERS[d.tierIdx];
   const l = LEASE_TYPES[d.leaseTypeIdx];
   const minDown = d.price * (1 - d.ltv),
     closing = d.price * 0.02;
   const escrowAvail = g.escrow ? g.escrow.amount : 0;
   const escrowUsed = Math.max(0, Math.min(Number(escrowInput) || 0, escrowAvail, d.price));
-  const effectiveDown = Math.max(minDown, escrowUsed);
-  const loanAmt = d.price - effectiveDown;
+  // chosen structure, escrow can push down payment above the slider setting
+  const chosenFrac = Math.max(downPctUI / 100, escrowUsed / d.price);
+  const uw = underwrite(d, chosenFrac, amortUI);
+  const effectiveDown = uw.down;
+  const loanAmt = uw.loanAmt;
+  const allCash = loanAmt <= 0;
   const fromCashForDown = Math.max(0, effectiveDown - escrowUsed);
   const fromCash = fromCashForDown + closing;
   const can = fromCash <= g.cash;
-  const pay = pmtCalc(loanAmt, d.rate, d.amortYears);
+  const pay = uw.payment;
+  const rateDiscount = d.rate - uw.rate;
+  const noiMoNow = d.grossRentMo - d.landlordOpexMo;
+  const dscr = pay > 0 ? noiMoNow * 12 / (pay * 12) : Infinity;
+  const amortOptions = [...new Set([15, 20, 25, 30].filter(y => y <= d.amortYears).concat([d.amortYears]))].sort((a, b) => a - b);
   const rentPerSqft = (d.grossRentMo * 12 / d.sqft).toFixed(2);
   const downPct = effectiveDown / d.price * 100;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
@@ -3980,32 +4855,127 @@ function OMModal({
       border: `1px solid ${C.line}`
     }
   }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between",
+    style: {
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs",
+    style: {
+      color: C.inkDim
+    }
+  }, "STRUCTURE THE DEBT"), /*#__PURE__*/React.createElement("div", {
+    className: "mono",
+    style: {
+      fontSize: 10,
+      color: C.inkDim
+    }
+  }, "Bank: ≥", Math.round((1 - d.ltv) * 100), "% down · ≤", d.amortYears, "-yr am")), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs flex justify-between",
+    style: {
+      color: C.ink
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Down payment"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.brass
+    }
+  }, downPct.toFixed(0), "% · ", fmt(effectiveDown))), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: minPctInit,
+    max: 100,
+    step: 1,
+    value: Math.max(minPctInit, Math.round(chosenFrac * 100)),
+    onChange: e => setDownPctUI(Number(e.target.value)),
+    className: "w-full mt-1",
+    style: {
+      accentColor: C.brass
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 mt-1 flex-wrap"
+  }, [minPctInit, 40, 50, 100].filter((v, i, a) => v >= minPctInit && a.indexOf(v) === i).map(v => /*#__PURE__*/React.createElement("button", {
+    key: v,
+    onClick: () => setDownPctUI(v),
+    className: "mono px-2 py-1",
+    style: {
+      fontSize: 10,
+      background: Math.round(chosenFrac * 100) === v ? C.brass : C.felt3,
+      color: Math.round(chosenFrac * 100) === v ? "#1A1408" : C.ink,
+      border: `1px solid ${C.line}`,
+      borderRadius: 4
+    }
+  }, v === minPctInit ? `MIN ${v}%` : v === 100 ? "ALL CASH" : v + "%"))), /*#__PURE__*/React.createElement("div", {
+    className: "mono text-xs mt-3",
+    style: {
+      color: C.ink
+    }
+  }, "Amortization"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 mt-1"
+  }, amortOptions.map(y => /*#__PURE__*/React.createElement("button", {
+    key: y,
+    onClick: () => setAmortUI(y),
+    className: "mono text-xs px-3 py-1.5",
+    style: {
+      background: amortUI === y ? C.brass : C.felt3,
+      color: amortUI === y ? "#1A1408" : C.ink,
+      border: `1px solid ${amortUI === y ? C.brass : C.line}`,
+      borderRadius: 4
+    }
+  }, y, "yr"))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 pt-2",
+    style: {
+      borderTop: `1px dashed ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
     className: "mono text-xs",
     style: {
       color: C.inkDim,
       marginBottom: 4
     }
-  }, "PURCHASE STRUCTURE"), /*#__PURE__*/React.createElement("div", {
+  }, "THE DEAL AS STRUCTURED"), /*#__PURE__*/React.createElement("div", {
     className: "mono text-xs flex flex-col gap-1",
     style: {
       color: C.ink
     }
-  }, /*#__PURE__*/React.createElement("div", null, "Down ", downPct.toFixed(0), "% (min ", Math.round((1 - d.ltv) * 100), "%): ", fmtFull(effectiveDown), " + closing 2%: ", fmtFull(closing)), escrowUsed > 0 && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "Down ", downPct.toFixed(0), "% + 2% closing"), /*#__PURE__*/React.createElement("span", null, fmtFull(effectiveDown + closing))), escrowUsed > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
     style: {
       color: C.brass
     }
-  }, "From 1031 escrow: ", fmtFull(escrowUsed)), /*#__PURE__*/React.createElement("div", null, "From cash: ", fmtFull(fromCash)), /*#__PURE__*/React.createElement("div", null, "New loan: ", fmtFull(loanAmt), " @ ", (d.rate * 100).toFixed(2), "%, ", d.amortYears, "-yr am → ", fmt(pay), "/mo"), d.valueAdd ? /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "From 1031 escrow"), /*#__PURE__*/React.createElement("span", null, fmtFull(escrowUsed))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "Cash needed at close"), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: C.flare
+      color: can ? C.ink : C.flare
     }
-  }, "Day-1 carry while vacant: ", fmt(-(d.landlordOpexMo + pay)), "/mo until stabilized") : /*#__PURE__*/React.createElement("div", {
+  }, fmtFull(fromCash))), allCash ? /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
     style: {
       color: C.sprout
     }
-  }, "Day-1 cash flow: ", fmt(d.grossRentMo - d.landlordOpexMo - pay), "/mo"))), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, "Financing"), /*#__PURE__*/React.createElement("span", null, "NONE — free & clear day 1")) : /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "Loan ", fmtFull(loanAmt), " @ ", (uw.rate * 100).toFixed(2), "%", rateDiscount > 0.0001 ? ` (−${(rateDiscount * 100).toFixed(2)} for extra equity)` : "", ", ", uw.amort, "yr"), /*#__PURE__*/React.createElement("span", null, fmt(pay), "/mo")), d.valueAdd ? /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
+    style: {
+      color: C.flare
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Day-1 carry while vacant"), /*#__PURE__*/React.createElement("span", null, fmt(-(d.landlordOpexMo + pay)), "/mo")) : /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between",
+    style: {
+      color: noiMoNow - pay >= 0 ? C.sprout : C.flare
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Day-1 cash flow"), /*#__PURE__*/React.createElement("span", null, fmt(noiMoNow - pay), "/mo")), !allCash && !d.valueAdd && /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between"
+  }, /*#__PURE__*/React.createElement("span", null, "DSCR as structured"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: dscr >= 1.25 ? C.sprout : dscr >= 1.10 ? C.gold : C.flare
+    }
+  }, isFinite(dscr) ? dscr.toFixed(2) + "x" : "—", dscr < 1.10 ? " ⚠ covenant risk" : ""))))), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 mt-4"
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => buyDeal(d.id, escrowUsed),
+    onClick: () => buyDeal(d.id, escrowUsed, chosenFrac, amortUI),
     disabled: !can,
     className: "disp font-extrabold px-4 py-2",
     style: {
